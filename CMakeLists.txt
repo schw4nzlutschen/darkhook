@@ -49,6 +49,7 @@ set(SOURCES_DARKHOOK
   "src/buffer.cpp"
   "src/hook.cpp"
   "src/trampoline.cpp"
+  "include/darkhook.cpp"
 )
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)

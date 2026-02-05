@@ -58,7 +58,7 @@ Include the main header:
 ```cpp
 #include <darkhook.hpp>
 
-using namespace darkhook::hooks;
+using namespace darkhook;
 
 // Hooked function
 void __fastcall example_func(void* a1, int a2) {
@@ -80,8 +80,9 @@ void initialize() {
 void destroy() {
     dh_disable_hook(DH_ALL_HOOKS);
 
-    dh_uninitialize();
     clear_hooks();
+    
+    dh_uninitialize();
 }
 ```
 
