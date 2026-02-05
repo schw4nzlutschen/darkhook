@@ -63,7 +63,12 @@ typedef struct _hook_entry
     LPVOID target;             // Address of the target function.
     LPVOID detour;             // Address of the detour or relay function.
     LPVOID trampoline;         // Address of the trampoline function.
-    UINT8  backup[8];           // Original prologue of the target function.
+
+    // size backup to the maximum patch we may write/restore.
+    // we may restore either:
+    // - sizeof(jmp_rel)                         (normal)
+    // - sizeof(jmp_rel) + sizeof(jmp_rel_short) (patch_above)
+    UINT8  backup[sizeof(jmp_rel) + sizeof(jmp_rel_short)];           // Original prologue of the target function.
 
     UINT8  patch_above  : 1;     // Uses the hot patch area.
     UINT8  is_enabled   : 1;     // Enabled.
@@ -262,6 +267,11 @@ static VOID process_thread_ips(HANDLE thread_handle, UINT pos, UINT action)
 //-------------------------------------------------------------------------
 static BOOL enumerate_threads(pfrozen_threads threads)
 {
+    // make enumerate_threads self-contained/safe to call.
+    threads->items = NULL;
+    threads->capacity = 0;
+    threads->size = 0;
+    
     BOOL succeeded = FALSE;
 
     HANDLE snapshot_handle = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -427,7 +437,10 @@ static dh_status enable_hook_low_level(UINT pos, BOOL enable)
             memcpy(patch_target, hook->backup, sizeof(jmp_rel));
     }
 
-    VirtualProtect(patch_target, patch_size, old_protect, &old_protect);
+    // don't reuse old_protect as out-param; 
+    // restore protection into a temp var.
+    DWORD tmp_protect;
+    VirtualProtect(patch_target, patch_size, old_protect, &tmp_protect);
 
     // Just-in-case measure.
     FlushInstructionCache(GetCurrentProcess(), patch_target, patch_size);
@@ -739,7 +752,7 @@ static dh_status enable_hook(LPVOID target, BOOL enable)
                 if (g_hooks.items[pos].is_enabled != enable)
                 {
                     frozen_threads threads;
-                    status = freeze_threads(&threads, pos, ACTION_ENABLE);
+                    status = freeze_threads(&threads, pos, enable ? ACTION_ENABLE : ACTION_DISABLE);
                     if (status == DH_OK)
                     {
                         status = enable_hook_low_level(pos, enable);
