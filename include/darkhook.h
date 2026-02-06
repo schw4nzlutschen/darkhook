@@ -48,6 +48,9 @@ typedef enum dh_status {
     // DarkHook is not initialized yet, or already uninitialized.
     DH_ERROR_NOT_INITIALIZED,
 
+    // DarkHook can't be uninitialized due to hooks that failed to be removed.
+    DH_ERROR_UNABLE_TO_UNINITIALIZE,
+
     // The hook for the specified target function is already created.
     DH_ERROR_ALREADY_CREATED,
 
