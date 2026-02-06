@@ -24,6 +24,7 @@ While g_freeze_lock is held:
 #include <windows.h>
 #include <tlhelp32.h>
 #include <limits.h>
+#include <cstdint>
 
 #include "../include/darkhook.h"
 #include "buffer.h"
@@ -56,12 +57,23 @@ While g_freeze_lock is held:
 #define HOOK_ENABLED      0x02      // Enabled.
 #define HOOK_QUEUE_ENABLE 0x04      // Queued for enabling/disabling when != is_enabled.
 
+// Hook lifecycle state.
+enum class _hook_state : uint8_t {
+    empty,      // The object is created, but the hook is not initialized
+    prepared,   // Trampoline + analysis ready
+    enabled,    // The code is patched
+    disabled,   // The patch has been removed, but trampoline is still alive.
+    destroyed   // Everything is freed
+};
+
 // Hook information.
 typedef struct _hook_entry
 {
     LPVOID target;             // Address of the target function.
     LPVOID detour;             // Address of the detour or relay function.
     LPVOID trampoline;         // Address of the trampoline function.
+
+	_hook_state state;         // Lifecycle state of the hook.
 
     // size backup to the maximum patch we may write/restore.
     // we may restore either:
@@ -115,7 +127,7 @@ static __forceinline BOOL hook_is_queued( phook_entry h )
     return ( h->flags & HOOK_QUEUE_ENABLE ) != 0;
 }
 
-static __forceinline VOID set_hook_state( phook_entry h, BOOL enable )
+static __forceinline VOID set_hook_flags( phook_entry h, BOOL enable )
 {
     if ( enable ) {
         h->flags |= HOOK_ENABLED | HOOK_QUEUE_ENABLE;
@@ -123,6 +135,36 @@ static __forceinline VOID set_hook_state( phook_entry h, BOOL enable )
     else {
         h->flags &= ~( HOOK_ENABLED | HOOK_QUEUE_ENABLE );
     }
+}
+
+// Checks if a state transition is valid. This is used to enforce the correct lifecycle of hooks.
+static bool is_transition_allowed( _hook_state from, _hook_state to ) {
+    switch ( from ) {
+    case _hook_state::empty:
+        return to == _hook_state::prepared;
+
+    case _hook_state::prepared:
+        return to == _hook_state::enabled || to == _hook_state::destroyed;
+
+    case _hook_state::enabled:
+        return to == _hook_state::disabled;
+
+    case _hook_state::disabled:
+        return to == _hook_state::enabled || to == _hook_state::destroyed;
+
+    default:
+        return false;
+    }
+}
+
+// Performs a state transition if allowed. Returns true if the transition was successful, false otherwise.
+static bool transition( hook_entry* h, _hook_state to ) 
+{
+    if ( !is_transition_allowed( h->state, to ) )
+        return false;
+
+    h->state = to;
+    return true;
 }
 
 // Returns INVALID_HOOK_POS if not found.
@@ -229,65 +271,50 @@ process_thread_ips:
   - Called ONLY while g_freeze_lock is held
   - Safe to read g_hooks without g_hooks_lock
 */
+/*
+process_thread_ips:
+  - Called ONLY while g_freeze_lock is held
+  - g_hooks MUST NOT be modified during this window
+*/
 static VOID process_thread_ips( HANDLE thread_handle, UINT pos, UINT action )
 {
-    // If the thread suspended in the overwritten area,
-    // move IP to the proper address.
-
-    CONTEXT c;
+    CONTEXT ctx{};
 #if defined(_M_X64) || defined(__x86_64__)
-    DWORD64* instruction_pointer = &c.Rip;
+    DWORD64* ip = &ctx.Rip;
 #else
-    DWORD* instruction_pointer = &c.Eip;
+    DWORD* ip = &ctx.Eip;
 #endif
-    UINT count;
 
-    c.ContextFlags = CONTEXT_CONTROL;
-    if ( !GetThreadContext( thread_handle, &c ) )
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    if ( !GetThreadContext( thread_handle, &ctx ) )
         return;
 
-    if ( pos == ALL_HOOKS_POS )
-    {
-        pos = 0;
-        count = g_hooks.size;
-    }
-    else
-    {
-        count = pos + 1;
-    }
+    UINT begin = ( pos == ALL_HOOKS_POS ) ? 0 : pos;
+    UINT end = ( pos == ALL_HOOKS_POS ) ? g_hooks.size : pos + 1;
 
-    for ( ; pos < count; ++pos )
+    for ( UINT i = begin; i < end; ++i )
     {
-        phook_entry hook = &g_hooks.items[ pos ];
-        BOOL        enable;
-        DWORD_PTR   ip;
+        phook_entry h = &g_hooks.items[ i ];
 
+        BOOL target_enabled;
         switch ( action )
         {
-        case ACTION_DISABLE:
-            enable = FALSE;
-            break;
-
-        case ACTION_ENABLE:
-            enable = TRUE;
-            break;
-
-        default: // ACTION_APPLY_QUEUED
-            enable = hook_is_queued( hook );
-            break;
+        case ACTION_ENABLE:       target_enabled = TRUE; break;
+        case ACTION_DISABLE:      target_enabled = FALSE; break;
+        default:                  target_enabled = hook_is_queued( h ); break;
         }
-        if ( hook_is_enabled( hook ) == enable )
+
+        if ( hook_is_enabled( h ) == target_enabled )
             continue;
 
-        if ( enable )
-            ip = find_new_ip( hook, *instruction_pointer );
-        else
-            ip = find_old_ip( hook, *instruction_pointer );
+        DWORD_PTR new_ip = target_enabled
+            ? find_new_ip( h, *ip )
+            : find_old_ip( h, *ip );
 
-        if ( ip != 0 )
+        if ( new_ip )
         {
-            *instruction_pointer = ip;
-            SetThreadContext( thread_handle, &c );
+            *ip = new_ip;
+            SetThreadContext( thread_handle, &ctx );
         }
     }
 }
@@ -500,52 +527,45 @@ static VOID unfreeze_threads( pfrozen_threads threads )
 // MUST NOT touch hook->flags.
 static dh_status patch_hook_code_only( UINT pos, BOOL enable )
 {
-    phook_entry hook = &g_hooks.items[ pos ];
-    DWORD old_protect;
-    SIZE_T patch_size = sizeof( jmp_rel );
-    LPBYTE patch_target = (LPBYTE)hook->target;
+    phook_entry h = &g_hooks.items[ pos ];
 
-    if ( hook->flags & HOOK_PATCH_ABOVE )
+    SIZE_T patch_size = sizeof( jmp_rel );
+    LPBYTE patch_addr = (LPBYTE)h->target;
+
+    if ( h->flags & HOOK_PATCH_ABOVE )
     {
-        patch_target -= sizeof( jmp_rel );
+        patch_addr -= sizeof( jmp_rel );
         patch_size += sizeof( jmp_rel_short );
     }
 
-    if ( !VirtualProtect( patch_target, patch_size,
-        PAGE_EXECUTE_READWRITE, &old_protect ) )
+    DWORD old_protect;
+    if ( !VirtualProtect( patch_addr, patch_size, PAGE_EXECUTE_READWRITE, &old_protect ) )
         return DH_ERROR_MEMORY_PROTECT;
 
     if ( enable )
     {
-        pjmp_rel j = (pjmp_rel)patch_target;
+        pjmp_rel j = (pjmp_rel)patch_addr;
         j->opcode = 0xE9;
         j->operand = (INT32)(
-            (LPBYTE)hook->detour - ( patch_target + sizeof( jmp_rel ) )
+            (LPBYTE)h->detour - ( patch_addr + sizeof( jmp_rel ) )
             );
 
-        if ( hook->flags & HOOK_PATCH_ABOVE )
+        if ( h->flags & HOOK_PATCH_ABOVE )
         {
-            pjmp_rel_short sj = (pjmp_rel_short)hook->target;
+            pjmp_rel_short sj = (pjmp_rel_short)h->target;
             sj->opcode = 0xEB;
             sj->operand = (INT8)(
-                0 - ( sizeof( jmp_rel_short ) + sizeof( jmp_rel ) )
+                0 - ( sizeof( jmp_rel ) + sizeof( jmp_rel_short ) )
                 );
         }
     }
     else
     {
-        memcpy(
-            patch_target,
-            hook->backup,
-            ( hook->flags & HOOK_PATCH_ABOVE )
-            ? sizeof( jmp_rel ) + sizeof( jmp_rel_short )
-            : sizeof( jmp_rel )
-        );
+        memcpy( patch_addr, h->backup, patch_size );
     }
 
-    DWORD tmp;
-    VirtualProtect( patch_target, patch_size, old_protect, &tmp );
-    FlushInstructionCache( GetCurrentProcess( ), patch_target, patch_size );
+    FlushInstructionCache( GetCurrentProcess( ), patch_addr, patch_size );
+    VirtualProtect( patch_addr, patch_size, old_protect, &old_protect );
 
     return DH_OK;
 }
@@ -572,8 +592,8 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
     //   - threads resumed
     //   - hook flags are updated
 
+    frozen_threads threads{};
     dh_status status = DH_OK;
-    frozen_threads threads;
 
     AcquireSRWLockExclusive( &g_hooks_lock );
 
@@ -583,20 +603,18 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
         return DH_ERROR_NOT_INITIALIZED;
     }
 
-    BOOL need_apply = FALSE;
-    for ( UINT i = 0; i < g_hooks.size; ++i )
+    UINT count = g_hooks.size;
+
+    for ( UINT i = 0; i < count; ++i )
     {
-        if ( hook_is_enabled( &g_hooks.items[ i ] ) != enable )
+        if ( !is_transition_allowed( g_hooks.items[ i ].state, enable ? _hook_state::enabled : _hook_state::disabled ) )
         {
-            need_apply = TRUE;
-            break;
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_INVALID_STATE;
         }
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
-
-    if ( !need_apply )
-        return DH_OK;
 
     AcquireSRWLockExclusive( &g_freeze_lock );
 
@@ -605,6 +623,7 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
         ALL_HOOKS_POS,
         enable ? ACTION_ENABLE : ACTION_DISABLE
     );
+
     if ( status != DH_OK )
     {
         ReleaseSRWLockExclusive( &g_freeze_lock );
@@ -613,7 +632,15 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
 
     AcquireSRWLockExclusive( &g_hooks_lock );
 
-    for ( UINT i = 0; i < g_hooks.size; ++i )
+    if ( g_hooks.size != count )
+    {
+        ReleaseSRWLockExclusive( &g_hooks_lock );
+        unfreeze_threads( &threads );
+        ReleaseSRWLockExclusive( &g_freeze_lock );
+        return DH_ERROR_INVALID_STATE;
+    }
+
+    for ( UINT i = 0; i < count; ++i )
     {
         if ( hook_is_enabled( &g_hooks.items[ i ] ) != enable )
         {
@@ -633,11 +660,17 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
 
     AcquireSRWLockExclusive( &g_hooks_lock );
 
-    for ( UINT i = 0; i < g_hooks.size; ++i )
+    for ( UINT i = 0; i < count; ++i )
     {
         if ( hook_is_enabled( &g_hooks.items[ i ] ) != enable )
         {
-            set_hook_state( &g_hooks.items[ i ], enable );
+            if ( !transition( &g_hooks.items[ i ], enable ? _hook_state::enabled : _hook_state::disabled ) )
+            {
+                ReleaseSRWLockExclusive( &g_hooks_lock );
+                return DH_ERROR_INVALID_STATE;
+            }
+
+            set_hook_flags( &g_hooks.items[ i ], enable );
         }
     }
 
@@ -693,6 +726,16 @@ dh_status WINAPI dh_uninitialize( VOID )
 
     // now destroy under hooks lock
     AcquireSRWLockExclusive( &g_hooks_lock );
+
+	// Ensure all hooks are disabled before uninitialization.
+    for ( UINT i = 0; i < g_hooks.size; ++i )
+    {
+        if ( g_hooks.items[ i ].state == _hook_state::enabled )
+        {
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_INVALID_STATE;
+        }
+    }
 
     uninitialize_buffer( );
     HeapFree( g_h_heap, 0, g_hooks.items );
@@ -758,6 +801,8 @@ dh_status WINAPI dh_create_hook( LPVOID target, LPVOID detour, LPVOID* original 
         return DH_ERROR_MEMORY_ALLOC;
     }
 
+    hook->state = _hook_state::empty;
+
     hook->target = trampoline_data.target;
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -792,15 +837,21 @@ dh_status WINAPI dh_create_hook( LPVOID target, LPVOID detour, LPVOID* original 
     if ( original != NULL )
         *original = hook->trampoline;
 
+    if ( !transition( hook, _hook_state::prepared ) )
+    {
+		// This should never happen, but if it does, we need to clean up the allocated resources.
+        free_buffer( hook->trampoline );
+        delete_hook_entry( g_hooks.size - 1 );
+        ReleaseSRWLockExclusive( &g_hooks_lock );
+        return DH_ERROR_INVALID_STATE;
+    }
+
     ReleaseSRWLockExclusive( &g_hooks_lock );
     return DH_OK;
 }
 
 dh_status WINAPI dh_remove_hook( LPVOID target )
 {
-    dh_status status;
-    BOOL need_disable;
-
     AcquireSRWLockExclusive( &g_hooks_lock );
 
     if ( g_h_heap == NULL )
@@ -816,66 +867,30 @@ dh_status WINAPI dh_remove_hook( LPVOID target )
         return DH_ERROR_NOT_CREATED;
     }
 
-    need_disable = hook_is_enabled( &g_hooks.items[ pos ] );
+    phook_entry h = &g_hooks.items[ pos ];
 
-    ReleaseSRWLockExclusive( &g_hooks_lock );
-
-    if ( need_disable )
-    {
-        frozen_threads threads;
-
-        AcquireSRWLockExclusive( &g_freeze_lock );
-        status = freeze_threads( &threads, pos, ACTION_DISABLE );
-        ReleaseSRWLockExclusive( &g_freeze_lock );
-
-        if ( status != DH_OK )
-            return status;
-
-        AcquireSRWLockExclusive( &g_hooks_lock );
-
-        pos = find_hook_entry( target );
-        if ( pos == INVALID_HOOK_POS )
-        {
-            ReleaseSRWLockExclusive( &g_hooks_lock );
-            unfreeze_threads( &threads );
-            return DH_ERROR_NOT_CREATED;
-        }
-
-        status = patch_hook_code_only( pos, FALSE );
-
-        ReleaseSRWLockExclusive( &g_hooks_lock );
-        unfreeze_threads( &threads );
-
-        if ( status != DH_OK )
-            return status;
-
-        AcquireSRWLockExclusive( &g_hooks_lock );
-
-        pos = find_hook_entry( target );
-        if ( pos != INVALID_HOOK_POS )
-        {
-            g_hooks.items[ pos ].flags &= ~HOOK_ENABLED;
-            g_hooks.items[ pos ].flags &= ~HOOK_QUEUE_ENABLE;
-        }
-
-        ReleaseSRWLockExclusive( &g_hooks_lock );
-    }
-
-    AcquireSRWLockExclusive( &g_hooks_lock );
-
-    pos = find_hook_entry( target );
-    if ( pos == INVALID_HOOK_POS )
+    if ( hook_is_enabled( h ) )
     {
         ReleaseSRWLockExclusive( &g_hooks_lock );
-        return DH_ERROR_NOT_CREATED;
+        return DH_ERROR_INVALID_STATE;
     }
 
-    free_buffer( g_hooks.items[ pos ].trampoline );
+    if ( h->state != _hook_state::prepared &&
+        h->state != _hook_state::disabled )
+    {
+        ReleaseSRWLockExclusive( &g_hooks_lock );
+        return DH_ERROR_INVALID_STATE;
+    }
+
+    transition( h, _hook_state::destroyed );
+
+    free_buffer( h->trampoline );
     delete_hook_entry( pos );
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
     return DH_OK;
 }
+
 
 static dh_status enable_hook( LPVOID target, BOOL enable )
 {
@@ -895,6 +910,25 @@ static dh_status enable_hook( LPVOID target, BOOL enable )
     {
         ReleaseSRWLockExclusive( &g_hooks_lock );
         return DH_ERROR_NOT_CREATED;
+    }
+
+    phook_entry h = &g_hooks.items[ pos ];
+
+    if ( enable )
+    {
+        if ( !is_transition_allowed( h->state, _hook_state::enabled ) )
+        {
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_INVALID_STATE;
+        }
+    }
+    else
+    {
+        if ( !is_transition_allowed( h->state, _hook_state::disabled ) )
+        {
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_INVALID_STATE;
+        }
     }
 
     enabled_snapshot = hook_is_enabled( &g_hooks.items[ pos ] );
@@ -939,7 +973,14 @@ static dh_status enable_hook( LPVOID target, BOOL enable )
     pos = find_hook_entry( target );
     if ( pos != INVALID_HOOK_POS )
     {
-		set_hook_state( &g_hooks.items[ pos ], enable );
+        if ( !transition( &g_hooks.items[ pos ], enable ? _hook_state::enabled : _hook_state::disabled ) )
+        {
+			// This should never happen, but if it does, we need to clean up the allocated resources.
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_INVALID_STATE;
+        }
+
+		set_hook_flags( &g_hooks.items[ pos ], enable );
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
@@ -964,8 +1005,6 @@ dh_status WINAPI dh_disable_hook( LPVOID target )
 
 static dh_status queue_hook( LPVOID target, BOOL queue_enable )
 {
-    dh_status status = DH_OK;
-
     AcquireSRWLockExclusive( &g_hooks_lock );
 
     if ( g_h_heap == NULL )
@@ -974,36 +1013,44 @@ static dh_status queue_hook( LPVOID target, BOOL queue_enable )
         return DH_ERROR_NOT_INITIALIZED;
     }
 
+    UINT begin, end;
+
     if ( target == DH_ALL_HOOKS )
     {
-        UINT i;
-        for ( i = 0; i < g_hooks.size; ++i )
-        {
-            if ( queue_enable )
-                g_hooks.items[ i ].flags |= HOOK_QUEUE_ENABLE;
-            else
-                g_hooks.items[ i ].flags &= ~HOOK_QUEUE_ENABLE;
-        }
+        begin = 0;
+        end = g_hooks.size;
     }
     else
     {
-        UINT pos = find_hook_entry( target );
-        if ( pos != INVALID_HOOK_POS )
+        begin = find_hook_entry( target );
+        if ( begin == INVALID_HOOK_POS )
         {
-            if ( queue_enable )
-                g_hooks.items[ pos ].flags |= HOOK_QUEUE_ENABLE;
-            else
-                g_hooks.items[ pos ].flags &= ~HOOK_QUEUE_ENABLE;
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_NOT_CREATED;
         }
+        end = begin + 1;
+    }
+
+    for ( UINT i = begin; i < end; ++i )
+    {
+        phook_entry h = &g_hooks.items[ i ];
+
+        if ( !is_transition_allowed( h->state, queue_enable ? _hook_state::enabled : _hook_state::disabled ) )
+        {
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_INVALID_STATE;
+        }
+
+        if ( queue_enable )
+            h->flags |= HOOK_QUEUE_ENABLE;
         else
-        {
-            status = DH_ERROR_NOT_CREATED;
-        }
+            h->flags &= ~HOOK_QUEUE_ENABLE;
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
-    return status;
+    return DH_OK;
 }
+
 
 dh_status WINAPI dh_queue_enable_hook( LPVOID target )
 {
@@ -1017,18 +1064,13 @@ dh_status WINAPI dh_queue_disable_hook( LPVOID target )
 
 dh_status WINAPI dh_apply_queued( VOID )
 {
-    // PHASE 1 (freeze):
-    //   - threads suspended
-    //   - ONLY executable memory is patched
-    //   - hook flags MUST NOT be modified
-    //
-    // PHASE 2 (commit):
-    //   - threads resumed
-    //   - hook flags are updated
-
     dh_status status = DH_OK;
-    frozen_threads threads;
+    frozen_threads threads{};
 
+    _hook_state* state_snapshot = nullptr;
+    UINT count = 0;
+
+	// phase 0: validate that all queued state changes are valid and take a snapshot of current states.
     AcquireSRWLockExclusive( &g_hooks_lock );
 
     if ( g_h_heap == NULL )
@@ -1037,41 +1079,102 @@ dh_status WINAPI dh_apply_queued( VOID )
         return DH_ERROR_NOT_INITIALIZED;
     }
 
-    BOOL need_apply = FALSE;
-    for ( UINT i = 0; i < g_hooks.size; ++i )
+    count = g_hooks.size;
+
+    state_snapshot = (_hook_state*)HeapAlloc(
+        g_h_heap, 0, count * sizeof( _hook_state )
+    );
+
+    if ( !state_snapshot )
     {
-        if ( hook_is_enabled( &g_hooks.items[ i ] ) !=
-            hook_is_queued( &g_hooks.items[ i ] ) )
+        ReleaseSRWLockExclusive( &g_hooks_lock );
+        return DH_ERROR_MEMORY_ALLOC;
+    }
+
+    BOOL need_apply = FALSE;
+
+    for ( UINT i = 0; i < count; ++i )
+    {
+        phook_entry h = &g_hooks.items[ i ];
+        state_snapshot[ i ] = h->state;
+
+        BOOL target = hook_is_queued( h );
+
+        if ( hook_is_enabled( h ) != target )
         {
+            if ( !is_transition_allowed(
+                h->state,
+                target ? _hook_state::enabled : _hook_state::disabled ) )
+            {
+                HeapFree( g_h_heap, 0, state_snapshot );
+                ReleaseSRWLockExclusive( &g_hooks_lock );
+                return DH_ERROR_INVALID_STATE;
+            }
             need_apply = TRUE;
-            break;
         }
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
 
     if ( !need_apply )
+    {
+        HeapFree( g_h_heap, 0, state_snapshot );
         return DH_OK;
+    }
 
+	// phase 1: freeze threads and apply code patches WITHOUT committing state changes (flags)
     AcquireSRWLockExclusive( &g_freeze_lock );
 
-    status = freeze_threads( &threads, ALL_HOOKS_POS, ACTION_APPLY_QUEUED );
+    status = freeze_threads(
+        &threads,
+        ALL_HOOKS_POS,
+        ACTION_APPLY_QUEUED
+    );
+
     if ( status != DH_OK )
     {
         ReleaseSRWLockExclusive( &g_freeze_lock );
+        HeapFree( g_h_heap, 0, state_snapshot );
         return status;
     }
 
+	// phase 1.5: validate that state didn't change during freeze (should never happen)
     AcquireSRWLockExclusive( &g_hooks_lock );
 
-    for ( UINT i = 0; i < g_hooks.size; ++i )
+    if ( g_hooks.size != count )
     {
-        phook_entry hook = &g_hooks.items[ i ];
-        BOOL target_state = hook_is_queued( hook );
+        ReleaseSRWLockExclusive( &g_hooks_lock );
+        unfreeze_threads( &threads );
+        ReleaseSRWLockExclusive( &g_freeze_lock );
+        HeapFree( g_h_heap, 0, state_snapshot );
+        return DH_ERROR_INVALID_STATE;
+    }
 
-        if ( hook_is_enabled( hook ) != target_state )
+    for ( UINT i = 0; i < count; ++i )
+    {
+        if ( g_hooks.items[ i ].state != state_snapshot[ i ] )
         {
-            status = patch_hook_code_only( i, target_state );
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            unfreeze_threads( &threads );
+            ReleaseSRWLockExclusive( &g_freeze_lock );
+            HeapFree( g_h_heap, 0, state_snapshot );
+            return DH_ERROR_INVALID_STATE;
+        }
+    }
+
+    ReleaseSRWLockExclusive( &g_hooks_lock );
+
+	// phase 2: apply code patches
+    AcquireSRWLockExclusive( &g_hooks_lock );
+
+    for ( UINT i = 0; i < count; ++i )
+    {
+        phook_entry h = &g_hooks.items[ i ];
+        BOOL target = hook_is_queued( h );
+
+        if ( hook_is_enabled( h ) != target )
+        {
+            status = patch_hook_code_only( i, target );
             if ( status != DH_OK )
                 break;
         }
@@ -1083,22 +1186,38 @@ dh_status WINAPI dh_apply_queued( VOID )
     ReleaseSRWLockExclusive( &g_freeze_lock );
 
     if ( status != DH_OK )
+    {
+        HeapFree( g_h_heap, 0, state_snapshot );
         return status;
+    }
 
+	// Phase 3: commit
     AcquireSRWLockExclusive( &g_hooks_lock );
 
-    for ( UINT i = 0; i < g_hooks.size; ++i )
+    for ( UINT i = 0; i < count; ++i )
     {
-        phook_entry hook = &g_hooks.items[ i ];
-        if ( hook_is_enabled( hook ) != hook_is_queued( hook ) )
+        phook_entry h = &g_hooks.items[ i ];
+        BOOL target = hook_is_queued( h );
+
+        if ( hook_is_enabled( h ) != target )
         {
-            set_hook_state( hook, hook_is_queued( hook ) );
+            if ( !transition( h, target ? _hook_state::enabled : _hook_state::disabled ) )
+            {
+                ReleaseSRWLockExclusive( &g_hooks_lock );
+                HeapFree( g_h_heap, 0, state_snapshot );
+                return DH_ERROR_INVALID_STATE;
+            }
+
+            set_hook_flags( h, target );
         }
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
+
+    HeapFree( g_h_heap, 0, state_snapshot );
     return DH_OK;
 }
+
 
 dh_status WINAPI dh_create_hook_api_ex(
     LPCWSTR module_name, LPCSTR proc_name, LPVOID detour,

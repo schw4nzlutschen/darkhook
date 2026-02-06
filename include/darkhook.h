@@ -78,7 +78,10 @@ typedef enum dh_status {
     DH_ERROR_MODULE_NOT_FOUND,
 
     // The specified function is not found.
-    DH_ERROR_FUNCTION_NOT_FOUND
+    DH_ERROR_FUNCTION_NOT_FOUND,
+
+	// The hook is in an invalid state for the requested operation.
+    DH_ERROR_INVALID_STATE
 } dh_status;
 
 // Can be passed as a parameter to dh_enable_hook, dh_disable_hook,
