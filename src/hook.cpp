@@ -554,6 +554,9 @@ dh_status WINAPI dh_uninitialize(VOID)
 {
     dh_status status = DH_OK;
 
+    if (status == DH_OK && g_hooks.size > 0)
+        status = DH_ERROR_UNABLE_TO_UNINITIALIZE;
+    
     enter_spin_lock();
 
     if (g_h_heap != NULL)
