@@ -269,12 +269,8 @@ static DWORD_PTR find_new_ip( phook_entry hook, DWORD_PTR ip )
 /*
 process_thread_ips:
   - Called ONLY while g_freeze_lock is held
-  - Safe to read g_hooks without g_hooks_lock
-*/
-/*
-process_thread_ips:
-  - Called ONLY while g_freeze_lock is held
   - g_hooks MUST NOT be modified during this window
+  - Aggregates IP rewrites and issues SetThreadContext at most once
 */
 static VOID process_thread_ips( HANDLE thread_handle, UINT pos, UINT action )
 {
@@ -291,6 +287,8 @@ static VOID process_thread_ips( HANDLE thread_handle, UINT pos, UINT action )
 
     UINT begin = ( pos == ALL_HOOKS_POS ) ? 0 : pos;
     UINT end = ( pos == ALL_HOOKS_POS ) ? g_hooks.size : pos + 1;
+
+    BOOL ip_changed = FALSE;
 
     for ( UINT i = begin; i < end; ++i )
     {
@@ -314,9 +312,12 @@ static VOID process_thread_ips( HANDLE thread_handle, UINT pos, UINT action )
         if ( new_ip )
         {
             *ip = new_ip;
-            SetThreadContext( thread_handle, &ctx );
+            ip_changed = TRUE;
         }
     }
+
+    if ( ip_changed )
+        SetThreadContext( thread_handle, &ctx );
 }
 
 static BOOL enumerate_threads( pfrozen_threads threads )
@@ -355,10 +356,9 @@ static BOOL enumerate_threads( pfrozen_threads threads )
                     }
                     else if ( threads->size >= threads->capacity )
                     {
-                        LPDWORD p;
-                        threads->capacity *= 2;
-                        p = (LPDWORD)HeapReAlloc(
-                            g_h_heap, 0, threads->items, threads->capacity * sizeof( DWORD ) );
+                        UINT new_capacity = threads->capacity * 2;
+                        LPDWORD p = (LPDWORD)HeapReAlloc(
+                            g_h_heap, 0, threads->items, new_capacity * sizeof( DWORD ) );
                         if ( p == NULL )
                         {
                             succeeded = FALSE;
@@ -366,6 +366,7 @@ static BOOL enumerate_threads( pfrozen_threads threads )
                         }
 
                         threads->items = p;
+                        threads->capacity = new_capacity;
                     }
                     threads->items[ threads->size++ ] = te.th32ThreadID;
                 }
@@ -435,51 +436,51 @@ static dh_status freeze_threads( pfrozen_threads threads, UINT pos, UINT action 
             if ( already )
                 continue;
 
-            HANDLE thread_handle = OpenThread( THREAD_ACCESS, FALSE, tid );
-            BOOL suspended = FALSE;
-
-            if ( thread_handle != NULL )
+            // Reserve a slot in the frozen-thread list BEFORE suspending,
+            // so a failed allocation cannot leave a thread suspended forever.
+            if ( threads->items == NULL )
             {
-                DWORD result = SuspendThread( thread_handle );
-                if ( result != (DWORD)-1 )
-                {
-                    suspended = TRUE;
-                    process_thread_ips( thread_handle, pos, action );
-                }
-                CloseHandle( thread_handle );
-            }
-
-            if ( suspended )
-            {
-                // append to frozen list
+                threads->capacity = INITIAL_THREAD_CAPACITY;
+                threads->items = (LPDWORD)HeapAlloc(
+                    g_h_heap, 0, threads->capacity * sizeof( DWORD ) );
                 if ( threads->items == NULL )
                 {
-                    threads->capacity = INITIAL_THREAD_CAPACITY;
-                    threads->items = (LPDWORD)HeapAlloc(
-                        g_h_heap, 0, threads->capacity * sizeof( DWORD ) );
-                    if ( threads->items == NULL )
-                    {
-                        status = DH_ERROR_MEMORY_ALLOC;
-                        break;
-                    }
+                    status = DH_ERROR_MEMORY_ALLOC;
+                    break;
                 }
-                else if ( threads->size >= threads->capacity )
-                {
-                    threads->capacity *= 2;
-                    LPDWORD p = (LPDWORD)HeapReAlloc(
-                        g_h_heap, 0, threads->items,
-                        threads->capacity * sizeof( DWORD ) );
-                    if ( p == NULL )
-                    {
-                        status = DH_ERROR_MEMORY_ALLOC;
-                        break;
-                    }
-                    threads->items = p;
-                }
-
-                threads->items[ threads->size++ ] = tid;
-                any_new = TRUE;
             }
+            else if ( threads->size >= threads->capacity )
+            {
+                UINT new_capacity = threads->capacity * 2;
+                LPDWORD p = (LPDWORD)HeapReAlloc(
+                    g_h_heap, 0, threads->items,
+                    new_capacity * sizeof( DWORD ) );
+                if ( p == NULL )
+                {
+                    status = DH_ERROR_MEMORY_ALLOC;
+                    break;
+                }
+                threads->items = p;
+                threads->capacity = new_capacity;
+            }
+
+            HANDLE thread_handle = OpenThread( THREAD_ACCESS, FALSE, tid );
+            if ( thread_handle == NULL )
+                continue;
+
+            DWORD result = SuspendThread( thread_handle );
+            if ( result == (DWORD)-1 )
+            {
+                CloseHandle( thread_handle );
+                continue;
+            }
+
+            process_thread_ips( thread_handle, pos, action );
+            CloseHandle( thread_handle );
+
+            // Slot was reserved up-front, so this append cannot fail.
+            threads->items[ threads->size++ ] = tid;
+            any_new = TRUE;
         }
 
         if ( round.items )
@@ -583,14 +584,17 @@ BEHAVIOR:
 */
 static dh_status enable_all_hooks_frozen( BOOL enable )
 {
-    // PHASE 1 (freeze):
-    //   - threads suspended
-    //   - ONLY executable memory is patched
-    //   - hook flags MUST NOT be modified
+    // PHASE 0 (validate, hooks_lock):
+    //   - validate transition machine for every hook
     //
-    // PHASE 2 (commit):
-    //   - threads resumed
-    //   - hook flags are updated
+    // PHASE 1 (freeze, freeze_lock + hooks_lock):
+    //   - re-validate (set may have changed while no lock was held)
+    //   - patch executable memory
+    //   - commit state + flags
+    //   - threads remain suspended for the WHOLE phase
+
+    const _hook_state desired_state =
+        enable ? _hook_state::enabled : _hook_state::disabled;
 
     frozen_threads threads{};
     dh_status status = DH_OK;
@@ -607,7 +611,7 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
 
     for ( UINT i = 0; i < count; ++i )
     {
-        if ( !is_transition_allowed( g_hooks.items[ i ].state, enable ? _hook_state::enabled : _hook_state::disabled ) )
+        if ( !is_transition_allowed( g_hooks.items[ i ].state, desired_state ) )
         {
             ReleaseSRWLockExclusive( &g_hooks_lock );
             return DH_ERROR_INVALID_STATE;
@@ -626,13 +630,29 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
 
     if ( status != DH_OK )
     {
+        unfreeze_threads( &threads );
         ReleaseSRWLockExclusive( &g_freeze_lock );
         return status;
     }
 
     AcquireSRWLockExclusive( &g_hooks_lock );
 
-    if ( g_hooks.size != count )
+    // Re-validate every hook state under both locks; the set could have
+    // changed (added/removed) between PHASE 0 and the freeze.
+    BOOL valid = ( g_hooks.size == count );
+    if ( valid )
+    {
+        for ( UINT i = 0; i < count; ++i )
+        {
+            if ( !is_transition_allowed( g_hooks.items[ i ].state, desired_state ) )
+            {
+                valid = FALSE;
+                break;
+            }
+        }
+    }
+
+    if ( !valid )
     {
         ReleaseSRWLockExclusive( &g_hooks_lock );
         unfreeze_threads( &threads );
@@ -640,14 +660,20 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
         return DH_ERROR_INVALID_STATE;
     }
 
+    // Patch + commit atomically under hooks_lock (still inside freeze window).
     for ( UINT i = 0; i < count; ++i )
     {
-        if ( hook_is_enabled( &g_hooks.items[ i ] ) != enable )
-        {
-            status = patch_hook_code_only( i, enable );
-            if ( status != DH_OK )
-                break;
-        }
+        phook_entry h = &g_hooks.items[ i ];
+
+        if ( hook_is_enabled( h ) == enable )
+            continue;
+
+        status = patch_hook_code_only( i, enable );
+        if ( status != DH_OK )
+            break;
+
+        transition( h, desired_state );
+        set_hook_flags( h, enable );
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
@@ -655,27 +681,7 @@ static dh_status enable_all_hooks_frozen( BOOL enable )
     unfreeze_threads( &threads );
     ReleaseSRWLockExclusive( &g_freeze_lock );
 
-    if ( status != DH_OK )
-        return status;
-
-    AcquireSRWLockExclusive( &g_hooks_lock );
-
-    for ( UINT i = 0; i < count; ++i )
-    {
-        if ( hook_is_enabled( &g_hooks.items[ i ] ) != enable )
-        {
-            if ( !transition( &g_hooks.items[ i ], enable ? _hook_state::enabled : _hook_state::disabled ) )
-            {
-                ReleaseSRWLockExclusive( &g_hooks_lock );
-                return DH_ERROR_INVALID_STATE;
-            }
-
-            set_hook_flags( &g_hooks.items[ i ], enable );
-        }
-    }
-
-    ReleaseSRWLockExclusive( &g_hooks_lock );
-    return DH_OK;
+    return status;
 }
 
 dh_status WINAPI dh_initialize( VOID )
@@ -894,8 +900,18 @@ dh_status WINAPI dh_remove_hook( LPVOID target )
 
 static dh_status enable_hook( LPVOID target, BOOL enable )
 {
-    dh_status status;
-    BOOL enabled_snapshot;
+    // PHASE 0 (validate): under hooks_lock, ensure the hook exists and the
+    //                     requested transition is allowed.
+    // PHASE 1 (freeze):   under freeze_lock + hooks_lock, re-validate, patch
+    //                     code, commit state. Threads are kept suspended for
+    //                     this entire window.
+    //
+    // Critical invariant: g_freeze_lock MUST be held continuously from
+    // freeze_threads() through unfreeze_threads(). It MUST NOT be released
+    // while any thread is still suspended.
+
+    const _hook_state desired_state =
+        enable ? _hook_state::enabled : _hook_state::disabled;
 
     AcquireSRWLockExclusive( &g_hooks_lock );
 
@@ -912,79 +928,68 @@ static dh_status enable_hook( LPVOID target, BOOL enable )
         return DH_ERROR_NOT_CREATED;
     }
 
-    phook_entry h = &g_hooks.items[ pos ];
-
-    if ( enable )
+    if ( !is_transition_allowed( g_hooks.items[ pos ].state, desired_state ) )
     {
-        if ( !is_transition_allowed( h->state, _hook_state::enabled ) )
-        {
-            ReleaseSRWLockExclusive( &g_hooks_lock );
-            return DH_ERROR_INVALID_STATE;
-        }
-    }
-    else
-    {
-        if ( !is_transition_allowed( h->state, _hook_state::disabled ) )
-        {
-            ReleaseSRWLockExclusive( &g_hooks_lock );
-            return DH_ERROR_INVALID_STATE;
-        }
+        ReleaseSRWLockExclusive( &g_hooks_lock );
+        return DH_ERROR_INVALID_STATE;
     }
 
-    enabled_snapshot = hook_is_enabled( &g_hooks.items[ pos ] );
     ReleaseSRWLockExclusive( &g_hooks_lock );
 
-    if ( enabled_snapshot == enable )
-        return enable ? DH_ERROR_ENABLED : DH_ERROR_DISABLED;
-
-    frozen_threads threads;
+    frozen_threads threads{};
+    dh_status status = DH_OK;
 
     AcquireSRWLockExclusive( &g_freeze_lock );
+
     status = freeze_threads(
         &threads,
         pos,
         enable ? ACTION_ENABLE : ACTION_DISABLE
     );
-    ReleaseSRWLockExclusive( &g_freeze_lock );
 
     if ( status != DH_OK )
+    {
+        // freeze_threads cleans up on failure but be defensive.
+        unfreeze_threads( &threads );
+        ReleaseSRWLockExclusive( &g_freeze_lock );
         return status;
+    }
 
     AcquireSRWLockExclusive( &g_hooks_lock );
 
+    // Re-locate and re-validate: another thread may have removed/recreated
+    // the hook between the validation phase and the freeze.
     pos = find_hook_entry( target );
     if ( pos == INVALID_HOOK_POS )
     {
         ReleaseSRWLockExclusive( &g_hooks_lock );
         unfreeze_threads( &threads );
+        ReleaseSRWLockExclusive( &g_freeze_lock );
         return DH_ERROR_NOT_CREATED;
     }
 
-    status = patch_hook_code_only( pos, enable );
-    ReleaseSRWLockExclusive( &g_hooks_lock );
-
-    unfreeze_threads( &threads );
-
-    if ( status != DH_OK )
-        return status;
-
-    AcquireSRWLockExclusive( &g_hooks_lock );
-
-    pos = find_hook_entry( target );
-    if ( pos != INVALID_HOOK_POS )
+    if ( !is_transition_allowed( g_hooks.items[ pos ].state, desired_state ) )
     {
-        if ( !transition( &g_hooks.items[ pos ], enable ? _hook_state::enabled : _hook_state::disabled ) )
-        {
-			// This should never happen, but if it does, we need to clean up the allocated resources.
-            ReleaseSRWLockExclusive( &g_hooks_lock );
-            return DH_ERROR_INVALID_STATE;
-        }
+        ReleaseSRWLockExclusive( &g_hooks_lock );
+        unfreeze_threads( &threads );
+        ReleaseSRWLockExclusive( &g_freeze_lock );
+        return DH_ERROR_INVALID_STATE;
+    }
 
-		set_hook_flags( &g_hooks.items[ pos ], enable );
+    status = patch_hook_code_only( pos, enable );
+    if ( status == DH_OK )
+    {
+        // Atomically commit state alongside the patch (still under hooks_lock).
+        transition( &g_hooks.items[ pos ], desired_state );
+        set_hook_flags( &g_hooks.items[ pos ], enable );
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
-    return DH_OK;
+
+    unfreeze_threads( &threads );
+    ReleaseSRWLockExclusive( &g_freeze_lock );
+
+    return status;
 }
 
 dh_status WINAPI dh_enable_hook( LPVOID target )
@@ -1064,13 +1069,12 @@ dh_status WINAPI dh_queue_disable_hook( LPVOID target )
 
 dh_status WINAPI dh_apply_queued( VOID )
 {
+    // Same shape as enable_all_hooks_frozen: validate, freeze, re-validate,
+    // patch + commit atomically under the freeze window.
+
     dh_status status = DH_OK;
     frozen_threads threads{};
 
-    _hook_state* state_snapshot = nullptr;
-    UINT count = 0;
-
-	// phase 0: validate that all queued state changes are valid and take a snapshot of current states.
     AcquireSRWLockExclusive( &g_hooks_lock );
 
     if ( g_h_heap == NULL )
@@ -1079,105 +1083,90 @@ dh_status WINAPI dh_apply_queued( VOID )
         return DH_ERROR_NOT_INITIALIZED;
     }
 
-    count = g_hooks.size;
-
-    state_snapshot = (_hook_state*)HeapAlloc(
-        g_h_heap, 0, count * sizeof( _hook_state )
-    );
-
-    if ( !state_snapshot )
-    {
-        ReleaseSRWLockExclusive( &g_hooks_lock );
-        return DH_ERROR_MEMORY_ALLOC;
-    }
-
+    UINT count = g_hooks.size;
     BOOL need_apply = FALSE;
 
     for ( UINT i = 0; i < count; ++i )
     {
         phook_entry h = &g_hooks.items[ i ];
-        state_snapshot[ i ] = h->state;
-
         BOOL target = hook_is_queued( h );
 
-        if ( hook_is_enabled( h ) != target )
+        if ( hook_is_enabled( h ) == target )
+            continue;
+
+        if ( !is_transition_allowed(
+            h->state,
+            target ? _hook_state::enabled : _hook_state::disabled ) )
         {
-            if ( !is_transition_allowed(
-                h->state,
-                target ? _hook_state::enabled : _hook_state::disabled ) )
-            {
-                HeapFree( g_h_heap, 0, state_snapshot );
-                ReleaseSRWLockExclusive( &g_hooks_lock );
-                return DH_ERROR_INVALID_STATE;
-            }
-            need_apply = TRUE;
+            ReleaseSRWLockExclusive( &g_hooks_lock );
+            return DH_ERROR_INVALID_STATE;
         }
+        need_apply = TRUE;
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
 
     if ( !need_apply )
-    {
-        HeapFree( g_h_heap, 0, state_snapshot );
         return DH_OK;
-    }
 
-	// phase 1: freeze threads and apply code patches WITHOUT committing state changes (flags)
     AcquireSRWLockExclusive( &g_freeze_lock );
 
-    status = freeze_threads(
-        &threads,
-        ALL_HOOKS_POS,
-        ACTION_APPLY_QUEUED
-    );
-
+    status = freeze_threads( &threads, ALL_HOOKS_POS, ACTION_APPLY_QUEUED );
     if ( status != DH_OK )
     {
+        unfreeze_threads( &threads );
         ReleaseSRWLockExclusive( &g_freeze_lock );
-        HeapFree( g_h_heap, 0, state_snapshot );
         return status;
     }
 
-	// phase 1.5: validate that state didn't change during freeze (should never happen)
     AcquireSRWLockExclusive( &g_hooks_lock );
 
-    if ( g_hooks.size != count )
+    // Re-validate after freeze. The set could have changed while no lock
+    // was held between PHASE 0 and the freeze.
+    BOOL valid = ( g_hooks.size == count );
+    if ( valid )
+    {
+        for ( UINT i = 0; i < count; ++i )
+        {
+            phook_entry h = &g_hooks.items[ i ];
+            BOOL target = hook_is_queued( h );
+
+            if ( hook_is_enabled( h ) == target )
+                continue;
+
+            if ( !is_transition_allowed(
+                h->state,
+                target ? _hook_state::enabled : _hook_state::disabled ) )
+            {
+                valid = FALSE;
+                break;
+            }
+        }
+    }
+
+    if ( !valid )
     {
         ReleaseSRWLockExclusive( &g_hooks_lock );
         unfreeze_threads( &threads );
         ReleaseSRWLockExclusive( &g_freeze_lock );
-        HeapFree( g_h_heap, 0, state_snapshot );
         return DH_ERROR_INVALID_STATE;
     }
 
-    for ( UINT i = 0; i < count; ++i )
-    {
-        if ( g_hooks.items[ i ].state != state_snapshot[ i ] )
-        {
-            ReleaseSRWLockExclusive( &g_hooks_lock );
-            unfreeze_threads( &threads );
-            ReleaseSRWLockExclusive( &g_freeze_lock );
-            HeapFree( g_h_heap, 0, state_snapshot );
-            return DH_ERROR_INVALID_STATE;
-        }
-    }
-
-    ReleaseSRWLockExclusive( &g_hooks_lock );
-
-	// phase 2: apply code patches
-    AcquireSRWLockExclusive( &g_hooks_lock );
-
+    // Patch + commit atomically.
     for ( UINT i = 0; i < count; ++i )
     {
         phook_entry h = &g_hooks.items[ i ];
         BOOL target = hook_is_queued( h );
 
-        if ( hook_is_enabled( h ) != target )
-        {
-            status = patch_hook_code_only( i, target );
-            if ( status != DH_OK )
-                break;
-        }
+        if ( hook_is_enabled( h ) == target )
+            continue;
+
+        status = patch_hook_code_only( i, target );
+        if ( status != DH_OK )
+            break;
+
+        transition( h, target ? _hook_state::enabled : _hook_state::disabled );
+        set_hook_flags( h, target );
     }
 
     ReleaseSRWLockExclusive( &g_hooks_lock );
@@ -1185,37 +1174,7 @@ dh_status WINAPI dh_apply_queued( VOID )
     unfreeze_threads( &threads );
     ReleaseSRWLockExclusive( &g_freeze_lock );
 
-    if ( status != DH_OK )
-    {
-        HeapFree( g_h_heap, 0, state_snapshot );
-        return status;
-    }
-
-	// Phase 3: commit
-    AcquireSRWLockExclusive( &g_hooks_lock );
-
-    for ( UINT i = 0; i < count; ++i )
-    {
-        phook_entry h = &g_hooks.items[ i ];
-        BOOL target = hook_is_queued( h );
-
-        if ( hook_is_enabled( h ) != target )
-        {
-            if ( !transition( h, target ? _hook_state::enabled : _hook_state::disabled ) )
-            {
-                ReleaseSRWLockExclusive( &g_hooks_lock );
-                HeapFree( g_h_heap, 0, state_snapshot );
-                return DH_ERROR_INVALID_STATE;
-            }
-
-            set_hook_flags( h, target );
-        }
-    }
-
-    ReleaseSRWLockExclusive( &g_hooks_lock );
-
-    HeapFree( g_h_heap, 0, state_snapshot );
-    return DH_OK;
+    return status;
 }
 
 
